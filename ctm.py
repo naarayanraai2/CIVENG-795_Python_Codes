@@ -1,243 +1,212 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Cell Transmission Model (CTM) for a simple freeway + on-ramp merge network.
+
+This script is designed as a macroscopic counterpart to the calibrated microscopic behavior.
+
+Methodology consistency:
+- You may *derive* macroscopic parameters from calibrated micro parameters conceptually,
+  but in code we use a triangular FD (vf, w, kjam, qmax) with reasonable defaults and allow
+  overriding via CLI. (This keeps the CTM stable and reproducible.)
+"""
 
 from __future__ import annotations
+
+import argparse
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# -------------------------
-# Unit helpers
-# -------------------------
-FTPS_TO_MPH = 0.681818  # 1 ft/s = 0.681818 mph
-FT_TO_M = 0.3048
 
-# ============================================================
-# 1) CTM core
-# ============================================================
-
-@dataclass
+@dataclass(frozen=True)
 class CTMParams:
-    vf: float       # ft/s
-    w: float        # ft/s
-    kjam: float     # veh/ft/lane
-    qmax: float     # veh/s/lane
-    dx: float       # ft
-    dt: float       # s
-    n_cells: int
+    vf: float      # free-flow speed (m/s)
+    w: float       # congestion wave speed (m/s)
+    kjam: float    # jam density (veh/m/lane)
+    qmax: float    # capacity (veh/s/lane)
 
 
-def triangular_from_cc(cc0_ft: float, cc1_s: float, vf: float, veh_len_ft: float):
+def triangular_fd_flow(k: np.ndarray, params: CTMParams) -> np.ndarray:
+    """q(k) = min(vf*k, w*(kjam - k))"""
+    return np.minimum(params.vf * k, params.w * (params.kjam - k))
+
+
+def ctm_simulate(
+    params: CTMParams,
+    lanes: int,
+    dx: float,
+    dt: float,
+    n_cells_main: int,
+    n_cells_ramp: int,
+    T: float,
+    q_in_main: float,   # veh/s total (all lanes)
+    q_in_ramp: float,   # veh/s total (ramp, assumed 1 lane)
+    p_main: float = 0.7,
+    p_ramp: float = 0.3
+):
     """
-    Very simple mapping:
-      jam spacing ~ CC0 + vehicle length
-      qmax ~ 1/CC1 (veh/s) as a crude headway->capacity mapping
+    Simple merge at the last cell:
+      - mainline: n_cells_main cells
+      - ramp: n_cells_ramp cells
+      - merge into downstream boundary
+
+    Returns:
+      k_main (nT x n_cells_main), v_main (nT x n_cells_main), q_main (nT x n_cells_main)
     """
-    s_jam = max(cc0_ft + veh_len_ft, 1.0)
-    kjam = 1.0 / s_jam
-    qmax = 1.0 / max(cc1_s, 0.1)       # veh/s
-    kc = qmax / max(vf, 1e-6)
-    w = qmax / max((kjam - kc), 1e-9)
-    return kjam, qmax, kc, w
+    nT = int(np.floor(T / dt)) + 1
 
+    # vehicle counts per cell per lane
+    n_main = np.zeros((nT, n_cells_main), dtype=float)
+    n_ramp = np.zeros((nT, n_cells_ramp), dtype=float)
 
-def ctm_simulate(params: CTMParams, T_end: float, q_in_func, q_out_cap=None):
-    nT = int(np.floor(T_end / params.dt)) + 1
-    ts = np.arange(0.0, nT * params.dt, params.dt)
-
-    k = np.zeros((params.n_cells, nT), dtype=float)          # veh/ft
-    q = np.zeros((params.n_cells + 1, nT), dtype=float)      # veh/s at boundaries
+    # Helper conversion: count n -> density k
+    def density(n):
+        return n / dx  # veh/m/lane
 
     for t in range(nT - 1):
-        S = np.minimum(params.vf * k[:, t], params.qmax)                  # veh/s
-        R = np.minimum(params.qmax, params.w * (params.kjam - k[:, t]))   # veh/s
+        k_main = density(n_main[t])
+        k_ramp = density(n_ramp[t])
 
-        q_in = float(q_in_func(ts[t]))
-        q[0, t] = min(q_in, R[0])
+        # demand/supply per lane
+        D_main = np.minimum(params.vf * k_main, params.qmax)  # veh/s/lane
+        S_main = np.minimum(params.w * (params.kjam - k_main), params.qmax)
 
-        for i in range(params.n_cells - 1):
-            q[i + 1, t] = min(S[i], R[i + 1])
+        D_ramp = np.minimum(params.vf * k_ramp, params.qmax)
+        S_ramp = np.minimum(params.w * (params.kjam - k_ramp), params.qmax)
 
-        out_cap = params.qmax if q_out_cap is None else float(q_out_cap)
-        q[params.n_cells, t] = min(S[params.n_cells - 1], out_cap)
+        # boundary inflows (convert total -> per lane)
+        q_in_main_lane = (q_in_main / max(lanes, 1))
+        q_in_ramp_lane = q_in_ramp  # ramp assumed single lane
 
-        for i in range(params.n_cells):
-            k[i, t + 1] = k[i, t] + (params.dt / params.dx) * (q[i, t] - q[i + 1, t])
-            k[i, t + 1] = float(np.clip(k[i, t + 1], 0.0, params.kjam))
+        # mainline sending/receiving between cells
+        y_main = np.zeros(n_cells_main + 1, dtype=float)  # flows across edges, per lane
+        y_ramp = np.zeros(n_cells_ramp + 1, dtype=float)
 
-    return ts, k, q
+        # upstream boundaries
+        y_main[0] = min(q_in_main_lane, S_main[0])
+        y_ramp[0] = min(q_in_ramp_lane, S_ramp[0])
 
+        # internal cell boundaries
+        for i in range(n_cells_main - 1):
+            y_main[i + 1] = min(D_main[i], S_main[i + 1])
 
-# ============================================================
-# 2) Derived fields (speed) + plots
-# ============================================================
+        for i in range(n_cells_ramp - 1):
+            y_ramp[i + 1] = min(D_ramp[i], S_ramp[i + 1])
 
-def ctm_speed_from_kq(k: np.ndarray, q: np.ndarray, eps: float = 1e-9) -> np.ndarray:
-    """
-    v(i,t) = q_out(i,t) / k(i,t)
-    returns v_fts: (n_cells, nT-1) ft/s
-    """
-    n_cells, nT = k.shape
-    q_out = q[1:n_cells + 1, :-1]       # (n_cells, nT-1)
-    k_mid = k[:, :-1]                  # (n_cells, nT-1)
-    v_fts = q_out / np.maximum(k_mid, eps)
-    return v_fts
+        # merge at downstream boundary
+        # available receiving of downstream "virtual" sink
+        S_down = params.qmax
 
+        send_main = D_main[-1]
+        send_ramp = D_ramp[-1]
 
-def plot_timespace_speed(ax, ts: np.ndarray, v_fts: np.ndarray, params: CTMParams,
-                         vmax_mph: float = 70.0):
-    """
-    Time–space heatmap of speed (mph).
-    FIXED pcolormesh dimensions using time edges and space edges.
-    """
-    v_mph = v_fts * FTPS_TO_MPH                  # (n_cells, nT-1)
-    v_plot = v_mph.T                             # (nT-1, n_cells)
+        # priority split
+        alloc_main = p_main * S_down
+        alloc_ramp = p_ramp * S_down
 
-    # space edges (n_cells+1)
-    x_edges_m = (np.arange(params.n_cells + 1) * params.dx) * FT_TO_M
+        y_main[-1] = min(send_main, alloc_main)
+        y_ramp[-1] = min(send_ramp, alloc_ramp)
 
-    # time edges (nT) so that (nT-1, n_cells) is valid for pcolormesh
-    # Example: ts is length nT, and v_plot has nT-1 rows -> perfect
-    t_edges = ts  # len = nT
+        # if unused capacity remains, let the other use it
+        used = y_main[-1] + y_ramp[-1]
+        spare = max(0.0, S_down - used)
+        if spare > 0:
+            # give to main first then ramp (arbitrary, but stable)
+            extra_main = min(spare, send_main - y_main[-1])
+            y_main[-1] += extra_main
+            spare -= extra_main
 
-    # Build 2D edge grids: (nT, n_cells+1)
-    X, T = np.meshgrid(x_edges_m, t_edges)
+            extra_ramp = min(spare, send_ramp - y_ramp[-1])
+            y_ramp[-1] += extra_ramp
 
-    pcm = ax.pcolormesh(X, T, v_plot, shading="flat", vmin=0.0, vmax=vmax_mph)
-    cb = plt.colorbar(pcm, ax=ax)
-    cb.set_label("Speed (mph)")
+        # conservation update: n(t+1) = n(t) + (in - out)*dt
+        for i in range(n_cells_main):
+            n_main[t + 1, i] = n_main[t, i] + (y_main[i] - y_main[i + 1]) * dt
 
-    ax.set_xlabel("Space x (m)")
-    ax.set_ylabel("Time (s)")
-    ax.set_title("Time–Space Diagram: Speed (mph)")
+        for i in range(n_cells_ramp):
+            n_ramp[t + 1, i] = n_ramp[t, i] + (y_ramp[i] - y_ramp[i + 1]) * dt
 
+        # clamp
+        n_main[t + 1] = np.clip(n_main[t + 1], 0.0, params.kjam * dx)
+        n_ramp[t + 1] = np.clip(n_ramp[t + 1], 0.0, params.kjam * dx)
 
-def plot_fundamental_diagram(ax, k: np.ndarray, q: np.ndarray, params: CTMParams,
-                            n_bins: int = 25, sample: int = 80000,
-                            density_units: str = "veh/mi/lane",
-                            flow_units: str = "veh/hr/lane",
-                            overlay_triangular: bool = True):
-    """
-    Fundamental diagram: scatter + binned mean curve.
-    """
-    n_cells, nT = k.shape
-    K = k[:, :-1].ravel()
-    Q = q[1:n_cells + 1, :-1].ravel()
+    # outputs for mainline
+    k_main = n_main / dx  # veh/m/lane
+    q_main = triangular_fd_flow(k_main, params)  # per lane
+    v_main = np.where(k_main > 1e-9, q_main / k_main, params.vf)
 
-    if sample is not None and len(K) > sample:
-        rng = np.random.default_rng(42)
-        idx = rng.choice(len(K), size=sample, replace=False)
-        K = K[idx]
-        Q = Q[idx]
-
-    if density_units == "veh/mi/lane":
-        Kp = K * 5280.0
-        k_label = "Density k (veh/mi/lane)"
-    else:
-        Kp = K
-        k_label = "Density k (veh/ft/lane)"
-
-    if flow_units == "veh/hr/lane":
-        Qp = Q * 3600.0
-        q_label = "Flow q (veh/hr/lane)"
-    else:
-        Qp = Q
-        q_label = "Flow q (veh/s/lane)"
-
-    # scatter
-    ax.scatter(Kp, Qp, s=4, alpha=0.15)
-
-    # binned mean line (red like your screenshot)
-    bins = np.linspace(Kp.min(), Kp.max(), n_bins + 1)
-    bin_idx = np.digitize(Kp, bins) - 1
-
-    k_cent, q_mean = [], []
-    for b in range(n_bins):
-        mask = (bin_idx == b)
-        if mask.sum() < 60:
-            continue
-        k_cent.append(0.5 * (bins[b] + bins[b + 1]))
-        q_mean.append(Qp[mask].mean())
-
-    if len(k_cent) > 0:
-        ax.plot(k_cent, q_mean, color="red", linewidth=2)
-
-    # optional triangular overlay
-    if overlay_triangular:
-        k_grid = np.linspace(0.0, params.kjam, 400)  # veh/ft
-        q_tri = np.minimum(params.vf * k_grid, params.w * (params.kjam - k_grid))  # veh/s
-
-        if density_units == "veh/mi/lane":
-            k_grid_p = k_grid * 5280.0
-        else:
-            k_grid_p = k_grid
-
-        if flow_units == "veh/hr/lane":
-            q_tri_p = q_tri * 3600.0
-        else:
-            q_tri_p = q_tri
-
-        ax.plot(k_grid_p, q_tri_p, linewidth=2)
-
-    ax.set_xlabel(k_label)
-    ax.set_ylabel(q_label)
-    ax.set_title("Fundamental Diagram: Flow vs Density")
-    ax.grid(True, alpha=0.3)
+    return k_main, v_main, q_main
 
 
-def plot_ctm_two_panel(ts: np.ndarray, k: np.ndarray, q: np.ndarray, params: CTMParams,
-                       vmax_mph: float = 70.0):
-    """
-    One figure with the two plots (like your screenshot).
-    """
-    v_fts = ctm_speed_from_kq(k, q)
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--T", type=float, default=3600.0, help="Simulation horizon (s)")
+    ap.add_argument("--dx", type=float, default=25.0, help="Cell length (m)")
+    ap.add_argument("--dt", type=float, default=0.8, help="Time step (s)")
+    ap.add_argument("--lanes", type=int, default=6, help="Number of mainline lanes")
+    ap.add_argument("--main-cells", type=int, default=20, help="Mainline cells")
+    ap.add_argument("--ramp-cells", type=int, default=6, help="Ramp cells")
+    ap.add_argument("--qmain", type=float, default=1200.0, help="Mainline inflow (veh/hr total)")
+    ap.add_argument("--qramp", type=float, default=400.0, help="Ramp inflow (veh/hr)")
+    ap.add_argument("--vf", type=float, default=29.0, help="Free-flow speed (m/s) ~ 65 mph")
+    ap.add_argument("--w", type=float, default=6.0, help="Congestion wave speed (m/s)")
+    ap.add_argument("--kjam", type=float, default=0.13, help="Jam density (veh/m/lane)")
+    ap.add_argument("--qmax", type=float, default=1980.0, help="Capacity (veh/hr/lane)")
+    ap.add_argument("--out", default="ctm.png", help="Output PNG")
+    return ap.parse_args()
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    plot_timespace_speed(ax1, ts, v_fts, params, vmax_mph=vmax_mph)
-    plot_fundamental_diagram(ax2, k, q, params, n_bins=25, sample=80000,
-                             density_units="veh/mi/lane", flow_units="veh/hr/lane",
-                             overlay_triangular=True)
-
-    fig.suptitle("Cellular Transmission Model Development", fontsize=22, y=1.03)
-    plt.tight_layout()
-    plt.show()
-
-
-# ============================================================
-# 3) Main
-# ============================================================
 
 def main():
-    cf = pd.read_csv("cf_best_params.csv")
-    CC0 = float(cf["CC0"].iloc[0])
-    CC1 = float(cf["CC1"].iloc[0])
+    args = parse_args()
 
-    vf = 95.0  # ft/s (~65 mph) - replace with calibrated free speed if you have it
-    veh_len_ft = 15.0
+    params = CTMParams(
+        vf=float(args.vf),
+        w=float(args.w),
+        kjam=float(args.kjam),
+        qmax=float(args.qmax) / 3600.0
+    )
 
-    kjam, qmax, kc, w = triangular_from_cc(CC0, CC1, vf, veh_len_ft)
+    k_main, v_main, q_main = ctm_simulate(
+        params=params,
+        lanes=args.lanes,
+        dx=args.dx,
+        dt=args.dt,
+        n_cells_main=args.main_cells,
+        n_cells_ramp=args.ramp_cells,
+        T=args.T,
+        q_in_main=float(args.qmain) / 3600.0,
+        q_in_ramp=float(args.qramp) / 3600.0,
+        p_main=0.7,
+        p_ramp=0.3
+    )
 
-    print("Derived FD params:")
-    print(f"  kjam={kjam:.6f} veh/ft ({kjam*5280:.1f} veh/mi)")
-    print(f"  qmax={qmax:.3f} veh/s  ({qmax*3600:.0f} veh/hr)")
-    print(f"  kc={kc:.6f} veh/ft    ({kc*5280:.1f} veh/mi)")
-    print(f"  w={w:.2f} ft/s")
+    # time-space plot (speed)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    # stability-ish requirement: dt <= dx/vf
-    p = CTMParams(vf=vf, w=w, kjam=kjam, qmax=qmax, dx=264.0, dt=1.0, n_cells=20)
+    im = axes[0].imshow(
+        v_main.T, aspect="auto", origin="lower",
+        extent=[0, args.T/60.0, 0, args.main_cells],
+    )
+    axes[0].set_title("CTM Time–Space Diagram (Speed)")
+    axes[0].set_xlabel("Time (min)")
+    axes[0].set_ylabel("Cell index")
+    fig.colorbar(im, ax=axes[0], label="m/s")
 
-    def q_in(t):
-        # veh/s
-        if t < 300:
-            return 1800 / 3600
-        if t < 600:
-            return 2400 / 3600
-        return 2000 / 3600
+    # fundamental diagram
+    k_grid = np.linspace(0.0, params.kjam, 400)
+    q_tri = np.minimum(params.vf * k_grid, params.w * (params.kjam - k_grid))
+    axes[1].plot(k_grid, q_tri * 3600.0, linewidth=2)
+    axes[1].set_title("Triangular Fundamental Diagram")
+    axes[1].set_xlabel("Density k (veh/m/lane)")
+    axes[1].set_ylabel("Flow q (veh/hr/lane)")
+    axes[1].grid(True, alpha=0.3)
 
-    ts, k, q = ctm_simulate(p, T_end=900.0, q_in_func=q_in, q_out_cap=None)
-    plot_ctm_two_panel(ts, k, q, p, vmax_mph=70.0)
+    plt.tight_layout()
+    fig.savefig(args.out, dpi=200, bbox_inches="tight")
+    print(f"Saved {args.out}")
+    plt.show()
 
 
 if __name__ == "__main__":
